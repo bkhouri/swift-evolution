@@ -13,7 +13,7 @@
 
 We propose first-class support for **workspaces** in Swift Package Manager: an organizational unit that groups multiple Swift packages together for unified dependency resolution, shared build state, and consistent developer workflows.
 
-A workspace is declared via a new `Workspace.swift` manifest at a workspace root. It lists member packages (each with its own `Package.swift`), and optionally declares workspace-wide dependencies that members can inherit. Under a workspace, SwiftPM commands (`swift build`, `swift test`, `swift run`, `swift package resolve`) operate across all members with a single shared `Package.resolved` and a unified `.build/` directory.
+A workspace is declared via a new `Workspace.swift` manifest at a workspace root. It lists member packages (each with its own `Package.swift`). Under a workspace, SwiftPM commands (`swift build`, `swift test`, `swift run`, `swift package resolve`) operate across all members with a single shared `Package.resolved` and a unified `.build/` directory.
 
 This proposal establishes first-class workspace support in SwiftPM: the manifest DSL, resolver plumbing, CLI surface, and IDE hooks needed for the primary monorepo and cross-repo local-development use cases. Several follow-on capabilities — cross-workspace composition, a workspace-level configuration surface, completing the `--multiroot-data-file` deprecation timeline, and an "adopt an existing package into a workspace" command — are deliberately out of scope here and captured in [Future direction](#future-direction).
 
@@ -23,7 +23,7 @@ Modern Swift codebases increasingly consist of multiple related packages. Two us
 
 ### Monorepos with many internal packages
 
- A team has an application composed of many internal libraries — `app`, `logging`, `networking`, `storage`. Today each is a separate SwiftPM package, and building the system requires one of:
+A team may have an application composed of many internal libraries — `app`, `logging`, `networking`, `storage`. Today each is a separate SwiftPM package, and building the system requires one of:
 
 - Publishing internal libraries to a registry (unnecessary friction for internal-only code).
 - Using `.package(path: "../lib-a")` in every downstream package (fragile — each package independently resolves its own graph, so a shared external dependency like swift-nio can drift to different versions across members).
@@ -31,7 +31,7 @@ Modern Swift codebases increasingly consist of multiple related packages. Two us
 
 ### Cross-repo local development
 
- A developer clones package A and its dependency B side-by-side and wants A to consume the local checkout of B rather than the pinned registry version. Today this requires `swift package edit`, path overrides, or careful `Package.swift` manipulation.
+A developer clones package A and its dependency B side-by-side and wants A to consume the local checkout of B rather than the pinned registry version. Today this requires `swift package edit`, path overrides, or careful `Package.swift` manipulation.
 
 Cargo (Rust), Yarn (JavaScript), and Pants (Python) all offer workspace concepts with unified dependency resolution as first-class citizens. Swift lacks a first-class equivalent.
 
@@ -39,7 +39,7 @@ SwiftPM already contains architectural machinery for multi-root graphs. `Package
 
 ## Proposed solution
 
-Introduce a `Workspace.swift` manifest file, placed at the workspace root and optionally coexisting with `Package.swift`. The manifest lists members and workspace-wide dependencies:
+Introduce a `Workspace.swift` manifest file, placed at the workspace root and optionally coexisting with `Package.swift`. The manifest lists members:
 
 ```swift
 // swift-tools-version: 999.0
@@ -54,14 +54,10 @@ let workspace = Workspace(
             ignoredStateDirectories: [.packageResolved],
         ),
     ],
-    dependencies: [
-        .package(url: "https://github.com/apple/swift-nio", from: "2.0.0"),
-        .package(url: "https://github.com/apple/swift-log", from: "1.0.0"),
-    ],
 )
 ```
 
-Members reference each other and workspace-inherited dependencies through new DSL:
+Members reference sibling members through new DSL and declare external deps normally:
 
 ```swift
 // packages/app/Package.swift
@@ -69,8 +65,8 @@ let package = Package(
     name: "app",
     dependencies: [
         .package(workspaceMember: "lib-a"),
-        .package(workspaceInherited: "swift-nio"),
-        .package(workspaceInherited: "swift-log", traits: ["structured"]),
+        .package(url: "https://github.com/apple/swift-nio", from: "2.0.0"),
+        .package(url: "https://github.com/apple/swift-log", from: "1.0.0"),
     ],
     ...
 )
@@ -102,11 +98,9 @@ New types in `PackageDescription`:
 ```swift
 public struct Workspace: Sendable {
     public let members: [Member]
-    public let dependencies: [Package.Dependency]
 
     public init(
         members: [Member],
-        dependencies: [Package.Dependency] = [],
     )
 
     public struct Member: Sendable, ExpressibleByStringLiteral {
@@ -130,19 +124,13 @@ public struct Workspace: Sendable {
 }
 ```
 
-New `Package.Dependency` factory methods:
+New `Package.Dependency` factory method:
 
 ```swift
 extension Package.Dependency {
     @available(_PackageDescription, introduced: 999.0)
     public static func package(
         workspaceMember id: String,
-        traits: Set<Package.Dependency.Trait> = [.defaults],
-    ) -> Package.Dependency
-
-    @available(_PackageDescription, introduced: 999.0)
-    public static func package(
-        workspaceInherited id: String,
         traits: Set<Package.Dependency.Trait> = [.defaults],
     ) -> Package.Dependency
 }
@@ -157,7 +145,6 @@ public struct WorkspaceManifest: Sendable {
     public let path: AbsolutePath
     public let toolsVersion: ToolsVersion
     public let members: [Member]
-    public let dependencies: [PackageDependency]
 
     public struct Member: Sendable {
         public let identity: PackageIdentity
@@ -171,7 +158,7 @@ The tools-version header (`// swift-tools-version: X.Y`) is required in `Workspa
 
 ### Model changes
 
-Two new cases on `PackageDependency.Kind` (public, forward-compatible under Swift's unfrozen-enum semantics):
+One new case on `PackageDependency.Kind` (public, forward-compatible under Swift's unfrozen-enum semantics):
 
 ```swift
 extension PackageDependency {
@@ -183,7 +170,6 @@ extension PackageDependency {
 
         // New:
         case workspaceMember(WorkspaceMember)
-        case workspaceInherited(WorkspaceInherited)
     }
 
     public struct WorkspaceMember {
@@ -196,45 +182,14 @@ extension PackageDependency {
         public let productFilter: ProductFilter
         // traits, etc.
     }
-
-    public struct WorkspaceInherited {
-        public let identity: PackageIdentity
-        /// The resolved concrete workspace-level source this member's
-        /// `.workspaceInherited` is bound to. `nil` in parse-time
-        /// output; populated at workspace load time from the workspace's
-        /// `dependencies:` declaration. Non-nil after successful
-        /// workspace load.
-        public let resolved: ResolvedInherited?
-        public let productFilter: ProductFilter
-        // traits, etc.
-
-        public enum ResolvedInherited {
-            case sourceControl(
-                location: SourceControl.Location,
-                requirement: SourceControl.Requirement,
-                nameForTargetDependencyResolutionOnly: String?,
-                registryIdentity: PackageIdentity?,
-            )
-            case registry(requirement: Registry.Requirement)
-            case fileSystem(
-                path: AbsolutePath,
-                nameForTargetDependencyResolutionOnly: String?,
-            )
-        }
-    }
 }
 ```
 
-#### Lifecycle of the two cases
+#### Lifecycle of the `.workspaceMember` case
 
 - `.workspaceMember` is a first-class dependency kind that flows through the entire codebase. At workspace load time, its `WorkspaceMember` payload is *augmented in place*: the `path` field (nil in parse-time output) is populated from the workspace's member map. Downstream code (resolver, graph builder, build system) handles `.workspaceMember` natively using the augmented path — semantically equivalent to a local `.fileSystem` dependency, but with the "this is a workspace member" affordance preserved for diagnostics and tooling.
-- `.workspaceInherited` is likewise a first-class dependency kind that flows through the entire codebase. At workspace load time, its `WorkspaceInherited` payload is *augmented in place*: the `resolved` field (nil in parse-time output) is populated with the concrete source (source-control URL + requirement, registry requirement, or file-system path) taken from the matching workspace-level `dependencies:` entry. Member-supplied traits are unioned with the workspace's traits; the member's `productFilter` is preserved. Downstream code handles `.workspaceInherited` natively by dispatching on `resolved` — semantically equivalent to handling the underlying concrete `.sourceControl` / `.registry` / `.fileSystem` case, but with the "this is inherited from the workspace" affordance preserved for diagnostics, tooling, and the workspace-level "declared but not inherited" audit.
 
 Documentation on `.workspaceMember`: *"After successful workspace load, `WorkspaceMember.path` is non-nil. Consumers observing this case with `path == nil` are looking at a parse-time manifest that has not yet been resolved against a workspace."*
-
-Documentation on `.workspaceInherited`: *"After successful workspace load, `WorkspaceInherited.resolved` is non-nil and identifies the concrete workspace-level source this member is bound to. Consumers observing this case with `resolved == nil` are looking at a parse-time manifest that has not yet been resolved against a workspace."*
-
-`swift package describe` participates in the case-preservation contract: `DescribedPackage.DescribedPackageDependency` (the Codable shape driving `describe --format json`) gains a `workspaceInherited(identity:, resolved:)` case alongside the existing `workspaceMember(identity:, path:)`. The nested `ResolvedInherited` mirrors the `PackageDependency.WorkspaceInherited.ResolvedInherited` variants (`.fileSystem`, `.sourceControl` with URL-form location, `.registry`), so tooling reading describe output can distinguish inherited from directly-declared deps while still seeing the concrete resolved source the workspace bound them to.
 
 ### Discovery and hybrid loading
 
@@ -260,19 +215,13 @@ Member paths must be relative to `Workspace.swift`. Absolute paths → hard erro
 1. **Load workspace manifest.** Read `Workspace.swift` via `ManifestLoader`; produce a `WorkspaceManifest`.
 2. **Resolve member paths.** Normalize relative paths against `Workspace.swift`'s directory; derive `PackageIdentity` per member from the last path component; error on collisions.
 3. **Load member manifests.** Each member's `Package.swift` evaluated as normal, producing a `Manifest` per member.
-4. **Resolve workspace-scoped deps.** For each member manifest, walk the dependency list:
-   - `.workspaceMember(...)` entries: look up the resolved absolute path in the workspace member map and populate the `path` field in place. The case stays as `.workspaceMember`.
-   - `.workspaceInherited(...)` entries: look up the matching workspace-level `dependencies:` entry by identity and populate the `resolved` field with the concrete source (source-control URL + requirement, registry requirement, or file-system path). Traits are unioned (workspace-authoritative versions); the member's `productFilter` is preserved. The case stays as `.workspaceInherited`.
-5. **Feed the resolved manifests to the existing graph loader**, with `PackageGraphRootInput.packages: [AbsolutePath]` set to all member paths. PubGrub's existing `<synthesized-root>` path handles N unversioned roots — identical to how `--multiroot-data-file` operates today. `.workspaceMember` and `.workspaceInherited` deps are handled by the resolver using their augmented payloads: `.workspaceMember` behaves as an unversioned local (`.fileSystem`) package at its resolved `path`; `.workspaceInherited` dispatches on `resolved` to behave as the corresponding concrete `.sourceControl` / `.registry` / `.fileSystem` case.
+4. **Resolve workspace-member paths.** For each member manifest, walk the dependency list; `.workspaceMember(...)` entries look up the resolved absolute path in the workspace member map and populate the `path` field in place. The case stays as `.workspaceMember`.
+5. **Feed the resolved manifests to the existing graph loader**, with `PackageGraphRootInput.packages: [AbsolutePath]` set to all member paths. PubGrub's existing `<synthesized-root>` path handles N unversioned roots — identical to how `--multiroot-data-file` operates today. Members' directly-declared external deps (`.package(url:)` / `.package(id:)` / `.package(path:)`) are unified across all member roots by PubGrub as it already does today. `.workspaceMember` is handled by the resolver using its augmented payload: it behaves as an unversioned local (`.fileSystem`) package at its resolved `path`.
 6. **Single shared `Package.resolved`** at workspace root, using the existing V3 schema unchanged. The schema is already root-agnostic (a flat `[PackageIdentity: ResolvedPackage]` map).
 
-### Trait union and error semantics
+### Error semantics
 
-A member consuming `.package(workspaceInherited: "swift-nio", traits: X)` where the workspace declared the same dependency with `traits: Y` receives the union `X ∪ Y`. Version constraints are workspace-authoritative — members cannot override versions.
-
-- Unknown identity in `workspaceInherited` → hard error at resolve: `"no workspace-level dependency 'foo' declared in Workspace.swift"`.
-- Workspace-level `dependencies:` entry that no member inherits → warning at end of resolve.
-- `.package(workspaceMember: ...)` or `.package(workspaceInherited: ...)` in a `Package.swift` loaded **outside** a workspace context (no `Workspace.swift` discoverable) → hard error at graph-load: *"this API requires a Workspace.swift in an ancestor directory."*
+- `.package(workspaceMember: ...)` in a `Package.swift` loaded **outside** a workspace context (no `Workspace.swift` discoverable) → hard error at graph-load: *"this API requires a Workspace.swift in an ancestor directory."*
 
 ### Member-level state files
 
@@ -295,7 +244,7 @@ Member `Package.resolved` files are read-once-and-ignored — the workspace's re
 - New: `swift workspace init [--members <path>[:type] ...]`.
 - `--members packages/lib-a packages/app:executable path/to/libc` — space-separated variadic; optional `:type` suffix per member specifies package type (default `library`; accepted types match `swift package init --type`).
 - Missing paths are scaffolded as full `InitPackage` output for the specified type. Existing paths with `Package.swift` are left alone (info line). Existing paths without `Package.swift` get one created.
-- Placement rationale: the workspace-scope subcommand tree is a top-level `swift workspace` command (a new `swift-workspace` executable), mirroring the precedent set by `swift package-registry`, `swift package-collection`, and `swift sdk` — each of which is a top-level SwiftPM command for its own scope. Every workspace-scope operation stays discoverable under one prefix (`swift workspace {init, add-member, list-members, remove-member, add-dependency, dump-workspace, override, config, resolve, update, clean, reset}`). The four workspace-aware commands that also live at the top level (`resolve`, `update`, `clean`, `reset`) are registered from the same struct type in both parent trees — `swift workspace resolve` invokes the identical implementation as `swift package resolve` rather than a duplicated command. The pre-existing `swift package init` command is untouched.
+- Placement rationale: the workspace-scope subcommand tree is a top-level `swift workspace` command (a new `swift-workspace` executable), mirroring the precedent set by `swift package-registry`, `swift package-collection`, and `swift sdk` — each of which is a top-level SwiftPM command for its own scope. Every workspace-scope operation stays discoverable under one prefix (`swift workspace {init, add-member, list-members, remove-member, dump-workspace, override, config, resolve, update, clean, reset}`). The four workspace-aware commands that also live at the top level (`resolve`, `update`, `clean`, `reset`) are registered from the same struct type in both parent trees — `swift workspace resolve` invokes the identical implementation as `swift package resolve` rather than a duplicated command. The pre-existing `swift package init` command is untouched.
 
 #### `swift workspace add-member` / `swift workspace list-members` / `swift workspace remove-member`
 
@@ -305,19 +254,9 @@ Manifest-editing commands that maintain the `members:` array in `Workspace.swift
 - `swift workspace list-members` — prints the workspace's member identities and paths.
 - `swift workspace remove-member <path>` — removes a member entry. Files under the member directory are not deleted; the entry is dropped from `members:` only.
 
-#### `swift workspace add-dependency`
-
-Manifest-editing counterpart to `swift package add-dependency`, differing in target and shape. Appends a `.package(...)` entry to `Workspace.swift`'s workspace-level `dependencies:` array (members reach the new dep via `.package(workspaceInherited: <identity>)`). Idempotent — re-running with the same source is a no-op that leaves the manifest byte-identical.
-
-- Subcommand-per-source shape (Argument Parser enforces mutual exclusion at parse time), matching the shape established by `swift workspace override add`:
-  - `swift workspace add-dependency path <path>` — appends a `.package(path: <path>)` entry. Relative paths are stored verbatim; SwiftPM resolves them against the workspace root at load time.
-  - `swift workspace add-dependency url <url> (--exact | --branch | --revision | --from | --up-to-next-minor-from) [--to <version>]` — appends a `.package(url: <url>, <requirement>)` entry using the same version-qualifier vocabulary as `swift package add-dependency`.
-  - `swift workspace add-dependency registry <identity> (--exact | --from | --up-to-next-minor-from) [--to <version>]` — appends a `.package(id: <identity>, <requirement>)` entry to be resolved via the package registry. `--branch` and `--revision` are rejected because the registry requirement doesn't support them.
-- The `add-dependency` subcommand-per-source shape is a deliberate deviation from `swift package add-dependency`, which uses a `--type url|path|registry` flag. Argument Parser has no first-class mutual-exclusion between options, and the subcommand shape lets the parser enforce it structurally — e.g. `--branch` never appears on the `path` subcommand's help output at all. This matches the `swift workspace override add` shape shipped in Phase 8C.
-
 #### `swift workspace override`
 
-- Manages a developer-local `.swiftpm/configuration/workspace-overrides.json` file that redirects a workspace-declared dependency to a different target without editing `Workspace.swift`.
+- Manages a developer-local `.swiftpm/configuration/workspace-overrides.json` file that redirects a member-declared dependency to a different target without editing the member's `Package.swift`.
 - Overrides are folded into the workspace `originHash`, so editing the overrides file triggers a re-resolve on the next command.
 - Subcommand-per-source shape (Argument Parser enforces mutual exclusion at parse time):
   - `swift workspace override add path <identity> <path>` — redirect to a local filesystem path (relative paths resolve against the workspace root).
@@ -329,7 +268,7 @@ Manifest-editing counterpart to `swift package add-dependency`, differing in tar
 #### `swift workspace config` (mirror commands)
 
 - Under a workspace, `swift package config {set-mirror, get-mirror, unset-mirror}` anchors to a single `<workspace-root>/.swiftpm/configuration/mirrors.json`. A mirror set from anywhere in the workspace is visible from anywhere in the workspace, including from the workspace root itself and from any member subdirectory. Members are no longer able to write to their own sibling-invisible `.swiftpm/`.
-- Mirror substitution applies at dependency-resolution time to workspace-level `dependencies:` — a member consuming `.package(workspaceInherited: "swift-nio")` picks up the mirror the same way it would if the dep were declared directly in the member's `Package.swift`. `swift package resolve` and `swift package update` under a workspace fetch from the mirror URL as expected.
+- Mirror substitution applies at dependency-resolution time to member-declared external deps. `swift package resolve` and `swift package update` under a workspace fetch from the mirror URL as expected.
 - Mirrored under `swift workspace config` so every workspace-scope config operation is discoverable under the same prefix.
 
 #### `swift package update`
@@ -363,7 +302,7 @@ Manifest-editing counterpart to `swift package add-dependency`, differing in tar
 
 #### `swift package edit` / `swift package unedit`
 
-Deferred under a workspace. Both commands hard-error with an actionable message directing the user at `swift workspace override` — the workspace-scoped replacement for the "redirect a dep to a local checkout" use case. `edit`'s per-dependency editable-checkout model collides with the workspace's shared `.build/` and `workspaceMember` / workspace-level dependency declarations; `workspace override` supersedes it cleanly.
+Deferred under a workspace. Both commands hard-error with an actionable message directing the user at `swift workspace override` — the workspace-scoped replacement for the "redirect a dep to a local checkout" use case. `edit`'s per-dependency editable-checkout model collides with the workspace's shared `.build/` and `workspaceMember` declarations; `workspace override` supersedes it cleanly.
 
 #### Global CLI flag renaming (coincidental cleanup)
 
@@ -421,32 +360,30 @@ The proposal has been implemented incrementally across a sequence of proof-of-co
 - **Phase 0** — Internal `Workspace` class renamed to `PackageWorkspace`; deprecated typealias retained.
 - **Phase 1** — Minimal workspace: `Workspace.swift` DSL, `WorkspaceManifest` model, discovery, multi-root loader wiring.
 - **Phase 2** — `.package(workspaceMember:)` DSL. Kind preserved through the graph load; `WorkspaceMember.path` augmented in place.
-- **Phase 3** — `.package(workspaceInherited:)` DSL. Kind preserved; `WorkspaceInherited.resolved` augmented in place. `resolved` covers `.sourceControl`, `.registry`, and `.fileSystem`.
 - **Phase 4** — CWD-inside-member Case A for `swift build`. Scratch stays at workspace root even when the command is invoked from a member subdirectory.
 - **Phase 5** — `--package <identity>` selector for `swift build`, threading `PackageIdentity` through `BuildSubset`.
 - **Phase 6** — `swift test` and `swift test list` in a workspace, including combined xUnit report + `--package` selector.
 - **Phase 7** — `swift run` collision handling. Ambiguous executable names produce an error listing candidates + owning members; `--package <identity> <exec>` resolves cross-member from anywhere.
-- **Phase 8** — `swift package resolve` writes `Package.resolved` at the workspace root, trailing warning aggregator lists per-member state files SwiftPM found but ignored, `ignoredStateDirectories` DSL suppresses per-kind warnings, `originHash` covers the union of member manifests + workspace-level `dependencies:`, and `BuildPlan`'s build-input tracking references the workspace-root `Package.resolved`.
-- **Phase 8B** — Workspace dependency overrides via `.swiftpm/configuration/workspace-overrides.json`. Overrides fold into `originHash`.
+- **Phase 8** — `swift package resolve` writes `Package.resolved` at the workspace root, trailing warning aggregator lists per-member state files SwiftPM found but ignored, `ignoredStateDirectories` DSL suppresses per-kind warnings, `originHash` covers the union of member manifests, and `BuildPlan`'s build-input tracking references the workspace-root `Package.resolved`.
+- **Phase 8B** — Member dependency overrides via `.swiftpm/configuration/workspace-overrides.json`. Overrides fold into `originHash`.
 - **Phase 8C** — `swift workspace override` subcommand tree (`add path`/`add url`/`add registry`, `remove`, `list [--format text|json]`).
-- **Phase 8-mirrors** — `swift package config` (set-mirror, get-mirror, unset-mirror) is workspace-aware: mirrors anchor to a single `<workspace-root>/.swiftpm/configuration/mirrors.json` (visible from anywhere in the workspace, including the workspace root itself), and mirror substitution applies at resolution time to `.workspaceInherited` deps. Same subcommands mirrored under `swift workspace config`.
-- **Phase 9** — `swift workspace init [--members <path>[:type] ...]` scaffolds a new workspace, plus manifest-editing companions `swift workspace add-member <path> [--scaffold [--type <type>]]`, `swift workspace list-members`, `swift workspace remove-member <path>`, and `swift workspace add-dependency {path,url,registry}` (workspace-level counterpart to `swift package add-dependency`, subcommand-per-source shape matching `swift workspace override add`). The workspace-scope subcommand tree is a **top-level** `swift workspace` command (a new `swift-workspace` executable), following the precedent of `swift package-registry`, `swift package-collection`, and `swift sdk`. The pre-existing `swift package init` command is untouched.
+- **Phase 8-mirrors** — `swift package config` (set-mirror, get-mirror, unset-mirror) is workspace-aware: mirrors anchor to a single `<workspace-root>/.swiftpm/configuration/mirrors.json` (visible from anywhere in the workspace, including the workspace root itself), and mirror substitution applies at resolution time to member-declared external deps. Same subcommands mirrored under `swift workspace config`.
+- **Phase 9** — `swift workspace init [--members <path>[:type] ...]` scaffolds a new workspace, plus manifest-editing companions `swift workspace add-member <path> [--scaffold [--type <type>]]`, `swift workspace list-members`, `swift workspace remove-member <path>`. The workspace-scope subcommand tree is a **top-level** `swift workspace` command (a new `swift-workspace` executable), following the precedent of `swift package-registry`, `swift package-collection`, and `swift sdk`. The pre-existing `swift package init` command is untouched.
 - **Phase 10** — `swift package show-dependencies` extended for all four output formats (text with `[workspace member]` tag, deduplicated flatlist, dot subgraph clusters, per-root JSON array), plus CWD focus and `--package` selector.
 - **Phase 11** — `swift package update` writes to workspace-root `Package.resolved`; `--package <identity>` and CWD focus restrict fresh pins to that member's transitive dep subtree while preserving pins outside the subtree.
 - **Phase 12** — `swift package clean` operates on the shared workspace-root `.build/`, emits an info line naming the cleaned path, and treats `--package` as an info-level no-op under a workspace.
-- **Phase 13** — `swift package describe` iterates every in-scope member for all three output formats (text with per-member `--- <identity> ---` headers, JSON array of per-member `DescribedPackage` records, per-member mermaid diagrams concatenated by a blank line), plus CWD focus and `--package` selector. `DescribedPackageDependency` gains a first-class `workspaceInherited(identity:, resolved:)` case so describe consumers can distinguish inherited deps from directly-declared ones while still seeing the concrete resolved source; the prior `preconditionFailure` on `.workspaceInherited` (which crashed describe on any workspace using `.package(workspaceInherited:)`) is replaced by the case-preserving handling.
-- **Phase 14** — `swift package dump-package` disambiguates in a workspace: from a workspace root with 2+ members without `--package`, the command errors with the known member identities; from inside a member, CWD auto-selects; `--package <identity>` overrides. Single-member workspaces auto-select and non-workspace usage is unchanged. Landed alongside the sibling command `swift workspace dump-workspace`, which dumps the parsed `Workspace.swift` (path, tools version, members `{identity, path}`, workspace-level dependencies) as JSON via a new `Encodable` conformance on `WorkspaceManifest`. The same slice also re-registers the four workspace-aware top-level commands (`resolve`, `update`, `clean`, `reset`) under `swift workspace` so `swift workspace resolve` invokes the identical struct as `swift package resolve` — no implementation duplication, chosen so every workspace-scope operation is discoverable under one prefix.
+- **Phase 13** — `swift package describe` iterates every in-scope member for all three output formats (text with per-member `--- <identity> ---` headers, JSON array of per-member `DescribedPackage` records, per-member mermaid diagrams concatenated by a blank line), plus CWD focus and `--package` selector.
+- **Phase 14** — `swift package dump-package` disambiguates in a workspace: from a workspace root with 2+ members without `--package`, the command errors with the known member identities; from inside a member, CWD auto-selects; `--package <identity>` overrides. Single-member workspaces auto-select and non-workspace usage is unchanged. Landed alongside the sibling command `swift workspace dump-workspace`, which dumps the parsed `Workspace.swift` (path, tools version, members `{identity, path}`) as JSON via a new `Encodable` conformance on `WorkspaceManifest`. The same slice also re-registers the four workspace-aware top-level commands (`resolve`, `update`, `clean`, `reset`) under `swift workspace` so `swift workspace resolve` invokes the identical struct as `swift package resolve` — no implementation duplication, chosen so every workspace-scope operation is discoverable under one prefix.
 - **Phase 15** — Error paths + edge cases. Landed as four sub-slices:
   - **15a/15b** — Load-time validation errors on `Workspace.swift` read like advice: empty members, absolute member paths, out-of-tree member paths, duplicate member identities, missing member directory, member without `Package.swift`, nested `Workspace.swift` in a member subtree, and nested `Workspace.swift` in an ancestor. Each case has a fixture under `Fixtures/Workspaces/S15_ErrorPaths/` and an e2e test asserting the actionable phrasing. `WorkspaceResolveError` gets `CustomStringConvertible` so runtime output reads as prose, not enum reflection.
   - **15c** — `--multiroot-data-file` co-specified with a discoverable `Workspace.swift` hard-errors at CLI init. `--package-path` → `--project-path` rename with both spellings aliased on the same option (`@Option(name: [.customLong("project-path"), .customLong("package-path")])` — ArgumentParser's last-wins semantics apply if both are supplied). A `--package-path` deprecation-warning path is scaffolded (`SwiftCommandState.isArgumentDeprecationWarranted(for:arguments:)` argv scanner + `Basics.Diagnostic.argumentDeprecated(flag:renamed:)` factory) but currently not wired up at the CLI startup emit sites — the ecosystem gets a rename with no warning noise in this release, and a follow-up turns the warning on.
-  - **15d** — `swift package edit` / `swift package unedit` under a workspace hard-error with an actionable message directing the user at `swift workspace override` (not "will be addressed in a follow-up" — the workspace-scoped replacement is already shipped in Phase 8C). `.package(workspaceMember:)` and `.package(workspaceInherited:)` used in a standalone `Package.swift` (no ancestor `Workspace.swift`) surface a hard error at load time by propagating `WorkspaceResolveError` through `loadRootManifests` instead of silently returning an empty manifest set.
+  - **15d** — `swift package edit` / `swift package unedit` under a workspace hard-error with an actionable message directing the user at `swift workspace override` (not "will be addressed in a follow-up" — the workspace-scoped replacement is already shipped in Phase 8C). `.package(workspaceMember:)` used in a standalone `Package.swift` (no ancestor `Workspace.swift`) surfaces a hard error at load time by propagating `WorkspaceResolveError` through `loadRootManifests` instead of silently returning an empty manifest set.
   - **15e (subcommand `--path` renames)** — The global `--package-path` → `--project-path` rename above opened up `--path` as a top-level spelling, which collided with two subcommand-local options that had always spelled themselves `--path`. Both are renamed with `--path` retained as a deprecated alias emitting a runtime warning: `swift package edit --path` → `--checkout-path`, and `swift package add-target --path` → `--binary-path`. Unlike the global `--package-path` deprecation, the subcommand-local `--path` deprecations *are* emitted at runtime, because the subcommand-local warning is scoped to a specific `run()` and does not risk global-scanner false positives.
 
 **Follow-up coverage landed after Phase 15:**
 
-- **Per-member trait isolation for `.workspaceInherited`.** `resolveInherited` already computed each member's `workspace ∪ member` trait union independently, but the multi-member case was not exercised. Unit and e2e tests (`S15_InheritedTraits` fixture) now lock in that two members inheriting the same workspace dep with divergent per-member `traits:` sets get their own trait unions with no cross-contamination.
-- **Per-member trait isolation for `.workspaceMember`.** Unlike `.workspaceInherited`, `.workspaceMember` has no workspace-level counterpart to merge with, so `resolveWorkspaceMemberPaths` preserves each consumer's authored trait set verbatim. Unit and e2e tests (`S15_MemberTraits` fixture) lock in per-consumer isolation for sibling-member references.
-- **Cross-package cycle detection through workspace-scoped edges.** `.workspaceMember` and `.workspaceInherited` edges participate in the module-level cross-package cycle scan just like ordinary `.package(path:)` / source-control / registry edges. E2E tests (`S15_WorkspaceMemberCycle`, `S15_WorkspaceInheritedCycle` fixtures) lock in that a target-level cycle traversing either workspace-scoped edge kind is rejected at graph load with a `cyclic dependency declaration` diagnostic naming the cycle path.
+- **Per-member trait isolation for `.workspaceMember`.** `.workspaceMember` has no workspace-level counterpart to merge with, so `resolveWorkspaceMemberPaths` preserves each consumer's authored trait set verbatim. Unit and e2e tests (`S15_MemberTraits` fixture) lock in per-consumer isolation for sibling-member references.
+- **Cross-package cycle detection through workspace-scoped edges.** `.workspaceMember` edges participate in the module-level cross-package cycle scan just like ordinary `.package(path:)` / source-control / registry edges. E2E tests (`S15_WorkspaceMemberCycle` fixture) lock in that a target-level cycle traversing a `.workspaceMember` edge is rejected at graph load with a `cyclic dependency declaration` diagnostic naming the cycle path.
 
 **Not yet implemented:**
 
@@ -456,18 +393,17 @@ The proposal has been implemented incrementally across a sequence of proof-of-co
 **Design decisions worth calling out:**
 
 - The workspace-scope subcommand tree ships as a **top-level** `swift workspace` command (a new `swift-workspace` executable) rather than as a nested `swift package workspace` subcommand tree. This mirrors the precedent set by `swift package-registry`, `swift package-collection`, and `swift sdk` — each of which is a top-level SwiftPM command for its own scope. Every workspace-scope operation stays discoverable under one prefix, and the pre-existing `swift package init` command is untouched.
-- Phase 8C landed a subcommand-per-source shape for `override add` (`add path`, `add url`, `add registry`) rather than a single flag-based `override add` with mutually-exclusive `--path` / `--url` / `--registry` options. Argument Parser has no first-class mutual-exclusion between options, and the subcommand shape lets the parser enforce it structurally — e.g. `--branch` never appears on the `path` subcommand's help output at all. `swift workspace add-dependency` follows the same shape for the same reason.
-- `swift package config` (`set-mirror` / `get-mirror` / `unset-mirror`) is workspace-aware: mirrors anchor to a workspace-root mirrors file and apply at resolution time to `.workspaceInherited` deps. The workspace-scope semantics fall out naturally from the "state anchors at workspace root" principle.
+- Phase 8C landed a subcommand-per-source shape for `override add` (`add path`, `add url`, `add registry`) rather than a single flag-based `override add` with mutually-exclusive `--path` / `--url` / `--registry` options. Argument Parser has no first-class mutual-exclusion between options, and the subcommand shape lets the parser enforce it structurally — e.g. `--branch` never appears on the `path` subcommand's help output at all.
+- `swift package config` (`set-mirror` / `get-mirror` / `unset-mirror`) is workspace-aware: mirrors anchor to a workspace-root mirrors file and apply at resolution time to member-declared external deps. The workspace-scope semantics fall out naturally from the "state anchors at workspace root" principle.
 - Phase 12's `--package` under-workspace behaviour is `info`-level, not `warning`-level. The request is benign (the shared `.build/` is cleaned regardless) and a warning would incorrectly imply user error.
 - The global path-flag rename lands as `--package-path` → `--project-path`. `--project-path` reads as "operate on this project root" and applies equally to a package root and a workspace root. Freeing up `--path` globally required renaming `edit`'s and `add-target`'s subcommand-local `--path` to `--checkout-path` and `--binary-path` respectively, with `--path` retained as a deprecated alias emitting a runtime warning.
 - The `--package-path` deprecation warning is currently scaffolded but not emitted at the CLI startup sites (the emit is present in source, commented out). The rename ships with `--package-path` as a fully-supported alias; a follow-up will turn the deprecation warning on once the ecosystem has had time to migrate scripts. The `Basics.Diagnostic.argumentDeprecated(flag:renamed:)` factory and `SwiftCommandState.isArgumentDeprecationWarranted(for:arguments:)` argv scanner are exercised by the subcommand-local `--path` deprecations on `edit` and `add-target`, so the deprecation infrastructure itself is production-tested.
 - `swift package edit` / `unedit`'s deferred-feature diagnostic under a workspace points at `swift workspace override` (the already-shipped Phase 8C replacement for the "redirect a dependency to a local checkout" use case) rather than emitting a generic "will be addressed in a follow-up" placeholder. Users hitting the guard get a concrete next step, not a promise.
-- `DescribedPackageDependency` gains a first-class `workspaceInherited(identity:, resolved:)` case in Phase 13 rather than unpacking `.workspaceInherited` into its concrete resolved kind. Preserves the "inherited from workspace" signal for describe consumers and IDE tooling; mirrors the case-preservation choice taken for `.workspaceMember` in Phase 2.
 
 ## Source compatibility
 
 - **`PackageDescription` DSL:** All additions gated on `@available(_PackageDescription, introduced: 999.0)`. Packages with tools-version < 999.0 continue to compile unchanged.
-- **`PackageDependency.Kind` new cases:** source-compatible under Swift's unfrozen-enum semantics — exhaustive switches on `Kind` in third-party code produce `@unknown default` warnings, not errors. Third-party code observing these cases with the augmentation payloads unpopulated (`.workspaceMember(path: nil)`, `.workspaceInherited(resolved: nil)`) is looking at a parse-time manifest and can defer handling to the post-load `packageRef` / `locationString` code paths.
+- **`PackageDependency.Kind` new case:** source-compatible under Swift's unfrozen-enum semantics — exhaustive switches on `Kind` in third-party code produce `@unknown default` warnings, not errors. Third-party code observing the `.workspaceMember` case with the augmentation payload unpopulated (`path: nil`) is looking at a parse-time manifest and can defer handling to the post-load `packageRef` / `locationString` code paths.
 - **`Workspace` class rename:** deprecated typealias preserves compat for one release.
 - **`--package-path` flag:** continues to work as a supported alias for the canonical `--project-path`. A deprecation-warning path is scaffolded but not yet emitted; a follow-up will turn it on once the ecosystem has had time to migrate scripts.
 - **`swift package edit --path` flag:** continues to work as a deprecated alias for `--checkout-path`; using the deprecated spelling emits a runtime warning steering users toward the new name.
@@ -481,36 +417,63 @@ SwiftPM's libSwiftPM is documented as unstable API (`Package.swift`: *"This API 
 
 ## Alternatives considered
 
-**Xcode-style workspaces (no unified resolution).** A workspace as a pure editing container, with each package resolving independently. Rejected — fails the primary motivation (drift across members' external deps).
+### Explicit workspace-level shared deps (`.workspaceInherited`)
+We considered a design where `Workspace.swift` declared a workspace-wide `dependencies:` array and members opted in via `.package(workspaceInherited: <identity>)` — a single committed place to author shared external version constraints, with member-side trait layering unioned at resolve time, and a "declared but not inherited" audit. Rejected for four reasons. First, resolution unification is already free: members are loaded as root manifests under PubGrub's `<synthesized-root>`, so divergent member declarations of the same external dep unify at resolve — "drift" is a declaration-hygiene concern, not a resolution bug. Second, `swift workspace override` already handles local redirection of member-declared deps, covering one of the strongest motivations for a workspace-level dep surface. Third, the DSL + model + lifecycle cost is nontrivial: a new `PackageDependency.Kind` case, an augment-in-place `resolved:` lifecycle, trait-union semantics at resolve, and ~7 downstream sites (resolver, graph builder, describe, show-dependencies, publish rewrite, dump, source serialization) that must handle it. The "one-file version bump across N members" ergonomic — the main user-facing win of the dropped design — is addressable without a new DSL kind: `swift workspace update-dependencies` (future direction below) rewrites version constraints across every member's `Package.swift` in one invocation. Fourth, the dropped design asks the workspace author to pre-declare every external dep every member might want, which scales poorly and discourages per-member constraint tightening. Accepted tradeoff: no central authored version floor in committed source; drift is a hygiene concern caught by review, CI, or lint — not by the type system.
 
-**Extending `Package.swift` with a `workspace:` field.** Rejected — conflates package definition with workspace definition; forces every workspace root to also be a package, restricting layouts.
 
-**JSON/TOML `.swiftpm/workspace.json`.** Rejected — breaks SwiftPM's Swift-DSL convention; loses type-checking, extensibility, and consistency with `Package.swift`.
+### Xcode-style workspaces (no unified resolution)
+A workspace as a pure editing container, with each package resolving independently. Rejected — fails the primary motivation (drift across members' external deps).
 
-**No new `PackageDependency.Kind` cases; workspace state injected into the manifest subprocess.** Rejected — couples manifest evaluation to workspace loading, complicates caching, breaks standalone member loading, requires new IPC surface for injecting workspace state.
+### Extending `Package.swift` with a `workspace:` field
+Rejected — conflates package definition with workspace definition; forces every workspace root to also be a package, restricting layouts.
 
-**Skip the internal `Workspace` rename.** Rejected — the collision is real in documentation, autocomplete, and LSP navigation despite living in different modules. The rename cost is bounded and mechanical; the clarity benefit is durable.
+### JSON/TOML `.swiftpm/workspace.json`
+Rejected — breaks SwiftPM's Swift-DSL convention; loses type-checking, extensibility, and consistency with `Package.swift`.
 
-**Workspace-authoritative version overrides.** We considered allowing members to override the workspace-level version pin. Rejected — allowing this defeats the primary purpose of workspace-wide dependencies (a single source of truth for versions). Members may layer traits but not versions.
+### No new `PackageDependency.Kind` cases; workspace state injected into the manifest subprocess
+Rejected — couples manifest evaluation to workspace loading, complicates caching, breaks standalone member loading, requires new IPC surface for injecting workspace state.
 
-**Migrating member `Package.resolved` files into workspace `Package.resolved`.** We considered auto-unioning member pins on first workspace resolve to preserve version stability during adoption. Rejected in favor of the safer "ignore + trailing warning" approach: migration risks surprising conflicts across members, and users adopting a workspace should consciously review the resulting resolution.
+### Skip the internal `Workspace` rename
+Rejected — the collision is real in documentation, autocomplete, and LSP navigation despite living in different modules. The rename cost is bounded and mechanical; the clarity benefit is durable.
 
-**Global `--multiroot-data-file` removal.** We considered removing the flag entirely as part of shipping workspaces. Rejected — Xcode's `.xcworkspace` is Xcode's format for Xcode's own needs; unilateral removal breaks Xcode integration. The flag is deprecated with a removal timeline instead, letting Xcode migrate on its own schedule.
+### Migrating member `Package.resolved` files into workspace `Package.resolved`.
+We considered auto-unioning member pins on first workspace resolve to preserve version stability during adoption. Rejected in favor of the safer "ignore + trailing warning" approach: migration risks surprising conflicts across members, and users adopting a workspace should consciously review the resulting resolution.
 
-**Rewrite `.workspaceMember` to `.fileSystem` at load time.** We considered transforming `.workspaceMember` cases to `.fileSystem` at the workspace load boundary, so downstream code (resolver, graph builder, build system) would remain workspace-unaware. Rejected in favor of the augmentation approach because kind preservation enables tooling affordances (e.g. the `[workspace member]` tag in `swift package show-dependencies` text output falls out naturally) and keeps the manifest observable downstream a faithful record of what the user wrote. The trade-off is workspace-awareness in ~7 downstream files; each site's handling is straightforward (treat `.workspaceMember` analogously to `.fileSystem(member.path!)`).
+### Global `--multiroot-data-file` removal
+We considered removing the flag entirely as part of shipping workspaces. Rejected — Xcode's `.xcworkspace` is Xcode's format for Xcode's own needs; unilateral removal breaks Xcode integration. The flag is deprecated with a removal timeline instead, letting Xcode migrate on its own schedule.
 
-**Rewrite `.workspaceInherited` to a concrete `.sourceControl` / `.registry` / `.fileSystem` at load time.** We considered transforming `.workspaceInherited` cases to their concrete workspace-declared source at the workspace load boundary (mirroring the alternative rewrite for `.workspaceMember` above), so downstream code would remain workspace-unaware. Rejected in favor of augmentation — mirroring the `.workspaceMember` decision above — for three reasons. First, kind preservation keeps `.workspaceInherited` observable for diagnostics ("resolution failed because workspace-inherited 'swift-nio' …") and IDE tooling that wants to distinguish "member declared this dependency locally" from "member is consuming the workspace's version." Second, the workspace-level "declared but not inherited by any member" audit needs to see `.workspaceInherited` entries at audit time to compute "used vs. unused"; with the rewrite approach, that audit either had to run pre-rewrite (fragile ordering) or on a separately-tracked identity set (an error-prone parallel data path). Third, the trade-off is small: only ~3 downstream sites (`toConstraintRequirement`, `packageRef`, `locationString`) need to handle the case, each by dispatching on the augmented `resolved` field to the corresponding concrete-kind logic.
+### Rewrite `.workspaceMember` to `.fileSystem` at load time
+We considered transforming `.workspaceMember` cases to `.fileSystem` at the workspace load boundary, so downstream code (resolver, graph builder, build system) would remain workspace-unaware. Rejected in favor of the augmentation approach because kind preservation enables tooling affordances (e.g. the `[workspace member]` tag in `swift package show-dependencies` text output falls out naturally) and keeps the manifest observable downstream a faithful record of what the user wrote. The trade-off is workspace-awareness in ~7 downstream files; each site's handling is straightforward (treat `.workspaceMember` analogously to `.fileSystem(member.path!)`).
 
 ## Future direction
 
-### Cross-workspace composition (workspace-of-workspaces)
+### Publishing a member package from within a workspace
 
-Today a `Workspace.swift` lists member `Package.swift` files. A natural extension is to let a workspace reference *another* workspace — either wholesale (compose all of that workspace's members) or per-member (depend on a single member of a sibling workspace). Two motivating scenarios:
+Members can declare dependencies on sibling members as `.workspaceMember(...)` (a path-based reference by identity). This form is not meaningful to a consumer that fetches the member standalone from a registry or source-control tag — the consumer has no sibling members on disk. A `swift workspace publish <member>` (or equivalent) command would need to materialize the member's manifest at publish time, rewriting each `.workspaceMember` entry to a stable external coordinate (registry identity + version, or source-control URL + tag) that matches how the sibling itself is being published, or vendoring the sibling bytes into the published archive. See the `plans/2026-08-24-swiftpm-workspaces-implementation.md` Phase 17 sketch for the vendoring-based approach.
 
-- **Very large monorepos** organized by team/domain. Each team owns a workspace; a build-of-builds workspace at the top composes team workspaces without flattening them into one giant `members:` list.
-- **Cross-repo shared dependencies.** Organization A publishes a workspace with a "public API" surface; downstream consumers depend on that workspace (or specific members of it) without republishing individual internal packages to a registry.
+Publishing without workspaces is itself an unfinished story in SwiftPM; this future direction is scoped to the *workspace-specific* materialization concerns and assumes a general publishing mechanism lands separately (or co-evolves).
 
-The design space includes: DSL surface (`.package(workspaceOf: "path")` vs a top-level `workspaces:` in `Workspace.swift`), identity behaviour across workspace boundaries (do members compose by identity? how are collisions resolved?), resolver composition (does PubGrub see one `<synthesized-root>` or nested roots?), and state-file scope (does the outer workspace own `Package.resolved` for the union, or does each nested workspace keep its own?). This proposal deliberately does not commit to a shape — a follow-up SE proposal will explore.
+### `swift workspace update-dependencies`
+
+> **Note:** There is a PR that introduces a `swift package update-depdencices` in [swiftlang/swift-package-manager#10212](https://github.com/swiftlang/swift-package-manager/pull/10212)
+
+With no workspace-level `dependencies:` surface, bumping a shared external dep across many members is a per-member edit. A `swift workspace update-dependencies [--package <identity>...] <dep-identity> --<requirement>` command would rewrite the version constraint on every member's declaration of the named external dep in one invocation, analogous to `swift package upgrade-dependencies` added in [swift-package-manager#10212](https://github.com/swiftlang/swift-package-manager/pull/10212). Scope selection matches the other workspace-aware commands: no `--package` edits every member that declares the dep; `--package <identity>` (repeatable) restricts to the named members. The command edits each member's `Package.swift` via the existing manifest-editing infrastructure. Deferred so the initial workspace proposal stays focused on the manifest-and-resolver surface.
+
+### Common build settings
+
+A workspace could declare build settings — Swift/C/C++/linker flags, preprocessor defines, warning treatments, unsafe-flag audit exemptions, strict-concurrency level — once and have every member inherit them, avoiding the current pattern where the same setting is copy-pasted into each member's `Package.swift`. Members could opt out or override on a per-target basis. This is a higher-value slice of the broader workspace-level configuration surface sketched above: build settings are the axis that otherwise churns across every member manifest whenever a project-wide flag changes (e.g. bumping strict concurrency, adding a new warning group, or introducing a shared define).
+
+### Build combinations
+
+Today each `swift build` invocation composes its configuration ad hoc from CLI flags (`-c`, `-Xswiftc`, sanitizers, triples). A workspace could declare named *build combinations* — for example `release-strict` (release + strict concurrency + warnings-as-errors), `debug-sanitized` (debug + ASan + TSan), or a cross-compilation matrix — and expose them as `swift workspace build --combination release-strict`. This lifts per-invocation flag juggling into a declarative, reviewable artifact in the workspace manifest, gives CI a shared vocabulary with local development, and makes matrix builds easier to express without shell orchestration.
+
+### Test combinations
+
+Analogous to build combinations, a workspace could declare named *test combinations* that fan a test run across platforms, Swift language modes, sanitizers, and member subsets. For example, a `release-integration` combination might run only integration-tagged tests across every member with release optimizations; a `pr-fast` combination might run only unit tests on the members touched by a diff. This gives CI a single entry point (`swift workspace test --combination pr-fast`) instead of orchestrating filtering and iteration across many `swift test` invocations, and keeps the combination definitions in-repo and reviewable alongside the code they exercise.
+
+### Implit Workspae members instead of explicit.
+
+For the initial proposal, it was opted to be explicit.  However, there is no reason Swift Workspace cannot search for `Package.swift` in the directory tree to determine it's members.  This would require additional considerations, such as not scanning directories under a nested-workspace directory. As such, it was opted to pursue this in a future direction if desireable.
 
 ### Turn on the `--package-path` deprecation warning.
 
@@ -529,15 +492,14 @@ Phase 15c introduced the *co-specification* hard error: passing `--multiroot-dat
 - **Migration guidance.** Document how to convert an `.xcworkspace` referencing SwiftPM packages into an equivalent `Workspace.swift`. Whether this is a tool (`swift workspace migrate --from-xcworkspace <path>`) or prose in the migration guide is a design decision the follow-up will settle.
 - **Removal timeline.** Xcode's `.xcworkspace` is Xcode's own format; SwiftPM removing `--multiroot-data-file` unilaterally would break the Xcode workflow. Any removal window must be coordinated with the Xcode team, and the target release must ship in a Swift toolchain Xcode is willing to adopt as its floor. This proposal specifies deprecation now and defers removal to that coordinated follow-up.
 
-**Workspace-level configuration surface.** Today a workspace lists members and workspace-wide dependencies but has no place to declare shared build settings, tools-version floors, or defaultable per-member configuration. A `configuration:` block on `Workspace(...)` — or a sibling type like `WorkspaceSettings` — could hoist "same setting across every member" without asking every member's `Package.swift` to repeat itself. Concrete candidates: default swift-tools-version, default platform floors, shared unsafe-flag audit exemptions, and shared trait defaults for `.workspaceInherited` deps. Out of scope for this proposal; a natural next chunk once the workspace surface stabilizes in-ecosystem.
+**Workspace-level configuration surface.** Today a workspace lists members but has no place to declare shared build settings, tools-version floors, or defaultable per-member configuration. A `configuration:` block on `Workspace(...)` — or a sibling type like `WorkspaceSettings` — could hoist "same setting across every member" without asking every member's `Package.swift` to repeat itself. Concrete candidates: default swift-tools-version, default platform floors, shared unsafe-flag audit exemptions. Out of scope for this proposal; a natural next chunk once the workspace surface stabilizes in-ecosystem.
 
-## Adopt an existing package into a workspace.
+### Adopt an existing package into a workspace.
 
 A `swift workspace add-member --scaffold` command exists (Phase 9) for scaffolding a new member. The reverse — an existing single-package project deciding to become a workspace — is currently hand-edited. A `swift workspace init --from-package .` or a `swift workspace adopt <path>` companion could:
 
 - Read the existing `Package.swift` at the target path.
 - Scaffold a sibling `Workspace.swift` with that package as the sole member.
-- Optionally sweep the package's external `dependencies:` into workspace-level `dependencies:` and rewrite the member's manifest to use `.package(workspaceInherited:)`.
 
 Out of scope for this proposal; a documented adoption story is a natural follow-up once the workspace DSL is in wide use.
 
